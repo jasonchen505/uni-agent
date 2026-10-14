@@ -82,6 +82,7 @@ worker_exec_with_env() {
     ssh -o StrictHostKeyChecking=no "${host}" "docker exec \
         -e VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO} \
         -e VERL_RL_INSIGHT_ENABLE=1 \
+        -e VERL_RL_INSIGHT_LEVEL=${VERL_RL_INSIGHT_LEVEL:-basic} \
         -e RL_INSIGHT_SERVER_URL=http://${hip}:${RL_INSIGHT_PORT} \
         -e OPENYUANRONG_SERVER_ADDRESS=${OPENYUANRONG_SERVER_ADDRESS} \
         -e OPENYUANRONG_TOKEN=${OPENYUANRONG_TOKEN} \

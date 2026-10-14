@@ -22,6 +22,7 @@ mount points (``on_score``/``on_route``) and all four ``on_write`` kinds.
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any
 
@@ -83,21 +84,41 @@ class FakeRLInsight:
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch: pytest.MonkeyPatch):
-    """Start each test with emit off and a clean gate cache; restore after."""
+    """Start each test with emit off and clean gate/level caches; restore after."""
     monkeypatch.delenv(facade.ENABLE_ENV, raising=False)
     monkeypatch.setattr(facade, "_enabled", None)
+    monkeypatch.delenv(facade.LEVEL_ENV, raising=False)
+    monkeypatch.setattr(facade, "_level", None)
+    monkeypatch.setattr(facade, "_level_warned", False)
     yield
 
 
 @pytest.fixture
 def enabled_emitter(monkeypatch: pytest.MonkeyPatch) -> FakeRLInsight:
-    """Enable emit and inject a recording fake as the rl_insight module.
+    """Enable emit at ``debug`` level and inject a recording fake as the rl_insight module.
 
     The fake goes into ``sys.modules`` so the facade's real gate → import →
-    init path runs; only the module itself is the test double.
+    init path runs; only the module itself is the test double. ``debug`` keeps
+    the pre-gating full-signal behavior for the tests below that pin it.
     """
     monkeypatch.setenv(facade.ENABLE_ENV, "1")
     monkeypatch.setattr(facade, "_enabled", True)  # pre-flip gate cache
+    monkeypatch.setenv(facade.LEVEL_ENV, "debug")
+    monkeypatch.setattr(facade, "_level", None)
+    monkeypatch.setattr(facade, "_level_warned", False)
+    fake = FakeRLInsight()
+    monkeypatch.setitem(sys.modules, "rl_insight", fake)
+    yield fake
+
+
+@pytest.fixture
+def basic_emitter(monkeypatch: pytest.MonkeyPatch) -> FakeRLInsight:
+    """Enable emit at the default (``basic``) level: no LEVEL env, fresh cache."""
+    monkeypatch.setenv(facade.ENABLE_ENV, "1")
+    monkeypatch.setattr(facade, "_enabled", True)  # pre-flip gate cache
+    monkeypatch.delenv(facade.LEVEL_ENV, raising=False)
+    monkeypatch.setattr(facade, "_level", None)
+    monkeypatch.setattr(facade, "_level_warned", False)
     fake = FakeRLInsight()
     monkeypatch.setitem(sys.modules, "rl_insight", fake)
     yield fake
@@ -285,3 +306,95 @@ def test_emit_spec_contract_covers_all_referenced_primitives():
         EmitKey.ROUTE_LATENCY_SECONDS,
     }
     assert referenced <= set(EMIT_SPECS)
+
+
+# ── level gating (VERL_RL_INSIGHT_LEVEL) ─────────────────────────────
+
+
+def test_emit_spec_levels_are_valid_and_classification_is_pinned():
+    assert all(spec.get("level") in ("basic", "debug") for spec in EMIT_SPECS.values())
+    debug_keys = {k for k, spec in EMIT_SPECS.items() if spec["level"] == "debug"}
+    # debug = the 6 A-class histograms + the derived inflight_avg_turn gauge;
+    # everything else (counters + core gauges) is basic.
+    assert debug_keys == {
+        EmitKey.LOAD,
+        EmitKey.S_CACHE,
+        EmitKey.AVAIL_RATIO,
+        EmitKey.NEED_RATIO,
+        EmitKey.REMAINING_RATIO,
+        EmitKey.ROUTE_LATENCY_SECONDS,
+        EmitKey.INFLIGHT_AVG_TURN,
+    }
+
+
+def test_default_level_is_basic_and_gates_debug_signals(basic_emitter: FakeRLInsight):
+    assert facade.get_emit_level() == "basic"
+    emitter.on_score("n0", {"load": 0.3, "s_cache": 0.7})
+    emitter.on_route(0.005)
+    emitter.on_write(
+        WriteEvent(
+            kind=WriteKind.ACQUIRE,
+            node="n0",
+            deltas={EmitKey.DISPATCHED_COUNT: 1, EmitKey.PROMPT_LEN_SUM: 2163},
+            new_values={EmitKey.INFLIGHT_TOKENS: 2163},
+            turn_sum=3,
+            inflight_count=2,
+        )
+    )
+
+    # Debug signals (A-class histograms + derived avg turn) are no-ops;
+    # basic signals still emit.
+    assert [c["name"] for c in basic_emitter.calls] == [
+        EmitKey.DISPATCHED_COUNT,
+        EmitKey.PROMPT_LEN_SUM,
+        EmitKey.INFLIGHT_TOKENS,
+    ]
+
+
+def test_debug_level_emits_full_set_like_before_gating(enabled_emitter: FakeRLInsight):
+    assert facade.get_emit_level() == "debug"
+    emitter.on_score("n0", {"load": 0.3, "s_cache": 0.7})
+    emitter.on_route(0.005)
+    emitter.on_write(
+        WriteEvent(
+            kind=WriteKind.ACQUIRE,
+            node="n0",
+            deltas={EmitKey.DISPATCHED_COUNT: 1, EmitKey.PROMPT_LEN_SUM: 2163},
+            new_values={EmitKey.INFLIGHT_TOKENS: 2163},
+            turn_sum=3,
+            inflight_count=2,
+        )
+    )
+
+    assert set(_by_name(enabled_emitter.calls)) == {
+        EmitKey.LOAD,
+        EmitKey.S_CACHE,
+        EmitKey.ROUTE_LATENCY_SECONDS,
+        EmitKey.DISPATCHED_COUNT,
+        EmitKey.PROMPT_LEN_SUM,
+        EmitKey.INFLIGHT_TOKENS,
+        EmitKey.INFLIGHT_AVG_TURN,
+    }
+
+
+def test_invalid_level_warns_once_and_falls_back_to_basic(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setenv(facade.ENABLE_ENV, "1")
+    monkeypatch.setattr(facade, "_enabled", True)
+    monkeypatch.setenv(facade.LEVEL_ENV, "verbose")
+    monkeypatch.setattr(facade, "_level", None)
+    monkeypatch.setattr(facade, "_level_warned", False)
+    fake = FakeRLInsight()
+    monkeypatch.setitem(sys.modules, "rl_insight", fake)
+
+    with caplog.at_level(logging.WARNING, logger=facade.__name__):
+        emitter.on_score("n0", {"load": 0.3})
+        emitter.on_score("n0", {"load": 0.4})
+
+    warnings = [r.getMessage() for r in caplog.records if "falling back to 'basic'" in r.getMessage()]
+    assert warnings == ["invalid VERL_RL_INSIGHT_LEVEL='verbose'; falling back to 'basic'"]
+    # Invalid level behaves as basic: debug gated out, basic still emits.
+    assert fake.calls == []
+    emitter.on_write(WriteEvent(kind=WriteKind.KV_REMOVED, node="n0", deltas={EmitKey.KV_EVICTIONS: 7}))
+    assert [c["name"] for c in fake.calls] == [EmitKey.KV_EVICTIONS]
